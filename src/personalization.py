@@ -1,80 +1,90 @@
-import os
-import sys
 import json
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-import google.generativeai as genai
+import re
+from pathlib import Path
 import pandas as pd
 from config import GEMINI_API_KEY
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.5-flash")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_ROOT / "data"
 
-PROMPT_TEMPLATE = """
-You are an expert Influencer Marketing Specialist. Generate two personalized outreach messages for the following influencer:
 
-Influencer Name: {name}
-Niche: {niche}
-Platform: {platform}
-Recent Content Context: {recent_content}
+def word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w’'-]+\b", str(text or "")))
 
-Generate JSON matching this schema strictly:
-{{
-  "email_pitch": "An email collaboration pitch referencing their content style. Length MUST be strictly between 60 and 90 words. Proposed collaboration: Paid UGC campaign.",
-  "instagram_dm": "A short, natural IG DM referencing their recent post. Length MUST be strictly between 15 and 30 words."
-}}
 
-Do not include any Markdown wrapper code blocks like ```json. Return raw JSON string only.
-"""
+def _topic(recent_content: str) -> str:
+    text = str(recent_content or "").strip().strip(".!\n")
+    # Keep the personalization signal concise so required message word limits remain valid.
+    words = text.split()[:6]
+    return " ".join(words) if words else "your recent content"
+
+
+def fallback_messages(name: str, niche: str, platform: str, recent_content: str) -> dict:
+    topic = _topic(recent_content)
+    email = (
+        f"Hi {name}, I came across your {platform} content about {topic} and appreciated how you share "
+        f"{niche} ideas with your audience. We are exploring a paid UGC collaboration for an upcoming campaign "
+        "and think your content could be a relevant fit. The partnership would include a clear brief, agreed "
+        "deliverables, and compensation discussed upfront. If you are interested, I would be happy to share the "
+        "campaign details and answer your questions. Would you be open to a quick conversation?"
+    )
+    dm = f"Hi {name}, I saw your {platform} post about {topic}. Your {niche} content may suit our paid creator campaign. Open to details?"
+    return {"email_pitch": email, "instagram_dm": dm}
+
+
+def _valid_lengths(data: dict) -> bool:
+    return 60 <= word_count(data.get("email_pitch", "")) <= 90 and 15 <= word_count(data.get("instagram_dm", "")) <= 30
+
 
 def generate_personalized_messages(name: str, niche: str, platform: str, recent_content: str) -> dict:
+    fallback = fallback_messages(name, niche, platform, recent_content)
     if not GEMINI_API_KEY:
-        # Fallback simulation if API key is not configured
-        return {
-            "email_pitch": f"Hi {name}, I loved your recent post about skincare! Your {niche} content resonated with us, and we would love to collaborate on a UGC campaign for our organic skincare line. We offer competitive compensation and free premium products for review. Let us know if you'd be interested in reviewing the collaboration details!",
-            "instagram_dm": f"Hi {name}, loved your latest post on skincare! Your audience would be perfect for our upcoming UGC campaign. Sent you an email!"
-        }
-
-    prompt = PROMPT_TEMPLATE.format(
-        name=name,
-        niche=niche,
-        platform=platform,
-        recent_content=recent_content
-    )
-    
+        return fallback
     try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        prompt = f"""Create two truthful personalized outreach drafts using only these supplied facts.
+Name: {name}
+Niche: {niche}
+Platform: {platform}
+Recent content title/caption: {recent_content}
+
+Return only valid JSON with keys email_pitch and instagram_dm. Email must be 60-90 words; DM must be 15-30 words. Do not invent audience demographics, results, personal experience, or details not provided. Suggest a paid UGC collaboration and avoid exaggerated claims."""
         response = model.generate_content(prompt)
         text = response.text.strip().replace("```json", "").replace("```", "").strip()
-        data = json.loads(text)
-        return data
-    except Exception as e:
-        print(f"LLM Generation Error for {name}: {e}")
-        return {
-            "email_pitch": f"Hi {name}, loved your content on {platform}. Your profile in {niche} is fantastic and matches our target brand aesthetic. We are running a UGC sponsorship campaign and would love to partner up. Please let us know if you are open to receiving a product package and details!",
-            "instagram_dm": f"Hey {name}, adore your {niche} content! Would love to collaborate on an upcoming project. Let us know if interested!"
-        }
+        result = json.loads(text)
+        if _valid_lengths(result):
+            return {"email_pitch": result["email_pitch"].strip(), "instagram_dm": result["instagram_dm"].strip()}
+    except Exception as exc:
+        print(f"Gemini personalization unavailable; using validated fallback: {exc}")
+    # Keep a reliable working path even if Gemini is unavailable or output violates limits.
+    if not _valid_lengths(fallback):
+        # Use a neutral caption so long titles cannot break required word limits.
+        fallback = fallback_messages(name, niche, platform, "your recent creator content")
+    return fallback
+
 
 def run_personalization():
-    df = pd.read_csv("data/enriched_influencers.csv")
-    
-    email_pitches = []
-    ig_dms = []
-    
-    for idx, row in df.iterrows():
-        if row["Filter Status"] == "PASSED":
-            msgs = generate_personalized_messages(
-                row["Name"], row["Category / Niche"], row["Platform"], row["Recent Content"]
-            )
-            email_pitches.append(msgs["email_pitch"])
-            ig_dms.append(msgs["instagram_dm"])
+    path = DATA_DIR / "enriched_influencers.csv"
+    if not path.exists():
+        raise FileNotFoundError("Run discovery and filtering first.")
+    df = pd.read_csv(path).fillna("")
+    emails, dms = [], []
+    for _, row in df.iterrows():
+        if str(row.get("Filter Status", "")) == "PASSED":
+            msgs = generate_personalized_messages(str(row.get("Name", "Creator")), str(row.get("Category / Niche", "")), str(row.get("Platform", "")), str(row.get("Recent Content", "")))
+            emails.append(msgs["email_pitch"])
+            dms.append(msgs["instagram_dm"])
         else:
-            email_pitches.append("N/A - Filter Failed")
-            ig_dms.append("N/A - Filter Failed")
-            
-    df["Generated Email Pitch"] = email_pitches
-    df["Generated Instagram DM"] = ig_dms
-    df.to_csv("data/enriched_influencers.csv", index=False)
-    print("Personalized messages successfully generated.")
+            emails.append("N/A - Filter Failed")
+            dms.append("N/A - Filter Failed")
+    df["Generated Email Pitch"] = emails
+    df["Generated Instagram DM"] = dms
+    df.to_csv(path, index=False)
+    return df
+
 
 if __name__ == "__main__":
     run_personalization()
+    print("Personalized messages saved to data/enriched_influencers.csv")

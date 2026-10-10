@@ -1,77 +1,86 @@
-import os
-import sys
 import json
+from pathlib import Path
+import re
 import pandas as pd
-
-# 1. Modify sys.path FIRST before importing config
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from config import FILTER_CRITERIA
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_ROOT / "data"
+
+
 def evaluate_influencer(record: dict) -> tuple[bool, str]:
-    """Applies classification logic and explains pass/fail reasons."""
     reasons = []
-    
-    # Niche Filter
-    if record["category_niche"] != FILTER_CRITERIA["target_niche"]:
-        reasons.append(f"Niche mismatch: '{record['category_niche']}' != '{FILTER_CRITERIA['target_niche']}'")
-        
-    # Follower Count Filter
-    followers = record["follower_count"]
+    niche = str(record.get("category_niche", "")).strip()
+    if niche.casefold() != FILTER_CRITERIA["target_niche"].casefold():
+        reasons.append(f"Niche mismatch: '{niche or 'Unknown'}' is not '{FILTER_CRITERIA['target_niche']}'")
+    try:
+        followers = int(record.get("follower_count") or 0)
+    except (TypeError, ValueError):
+        followers = 0
     if not (FILTER_CRITERIA["min_followers"] <= followers <= FILTER_CRITERIA["max_followers"]):
-        reasons.append(f"Followers ({followers}) outside required range [{FILTER_CRITERIA['min_followers']}-{FILTER_CRITERIA['max_followers']}]")
-        
-    # Engagement Rate Filter
-    engagement = record["engagement_rate"]
+        reasons.append(f"Followers ({followers}) outside {FILTER_CRITERIA['min_followers']}-{FILTER_CRITERIA['max_followers']}")
+    try:
+        engagement = float(record.get("engagement_rate") or 0)
+    except (TypeError, ValueError):
+        engagement = 0.0
     if engagement < FILTER_CRITERIA["min_engagement_rate"]:
-        reasons.append(f"Engagement rate ({engagement}%) below threshold ({FILTER_CRITERIA['min_engagement_rate']}%)")
-        
-    passed = len(reasons) == 0
-    status_reason = "Passed all criteria" if passed else "Failed: " + "; ".join(reasons)
-    return passed, status_reason
+        reasons.append(f"Engagement proxy ({engagement:.2f}%) below {FILTER_CRITERIA['min_engagement_rate']}% threshold")
+    return (not reasons, "Passed all criteria" if not reasons else "Failed: " + "; ".join(reasons))
 
-def process_and_enrich(input_file="data/raw_influencers.json"):
-    # Ensure data folder exists
-    os.makedirs("data", exist_ok=True)
 
-    if not os.path.exists(input_file):
-        raise FileNotFoundError(f"Input file '{input_file}' not found. Please run discovery script first!")
+def infer_content_themes(text: str) -> str:
+    text = str(text or "").lower()
+    themes = []
+    for keywords, label in [
+        (("skincare", "skin care", "serum", "moisturizer", "beauty", "makeup"), "Skincare/Beauty"),
+        (("outfit", "fashion", "style", "dress", "lookbook"), "Fashion/Style"),
+        (("routine", "daily", "vlog", "day in my life"), "Routine/Vlog"),
+        (("review", "unboxing", "testing", "product"), "Product Review"),
+        (("fitness", "workout", "gym", "training"), "Fitness"),
+        (("tech", "phone", "laptop", "software", "gadget"), "Technology"),
+    ]:
+        if any(word in text for word in keywords):
+            themes.append(label)
+    return ", ".join(themes) if themes else ("Based on available caption: " + str(text)[:100] if text else "Not Available")
 
-    with open(input_file, "r") as f:
+
+def process_and_enrich(input_file=None):
+    source = Path(input_file) if input_file else DATA_DIR / "raw_influencers.json"
+    if not source.is_absolute():
+        source = PROJECT_ROOT / source
+    if not source.exists():
+        raise FileNotFoundError(f"Input file not found: {source}. Run discovery first.")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with source.open(encoding="utf-8") as f:
         influencers = json.load(f)
-        
-    processed_records = []
-    
+    processed = []
     for inf in influencers:
         passed, reason = evaluate_influencer(inf)
-        
-        # Profile Enrichment & Strict Validation
-        email = inf.get("contact_email")
-        if not email or str(email).strip() == "" or str(email).lower() == "none":
-            enriched_email = "Not Found"
-        else:
-            enriched_email = email.strip()
-
-        enriched_record = {
-            "Name": inf["name"],
-            "Platform": inf["platform"],
-            "Profile URL": inf["profile_url"],
-            "Follower Count": inf["follower_count"],
-            "Engagement Rate (%)": inf["engagement_rate"],
-            "Category / Niche": inf["category_niche"],
-            "Content Themes": "Skincare, Daily Vlogs, Organic Beauty",
-            "Contact Email": enriched_email,
+        email = str(inf.get("contact_email") or "").strip()
+        if not email or email.lower() in {"none", "nan", "not found"}:
+            email = "Not Found"
+        # Do not infer demographics or invent missing information.
+        content = str(inf.get("recent_post_caption") or "")
+        processed.append({
+            "Name": inf.get("name", "Unknown"),
+            "Platform": inf.get("platform", "Unknown"),
+            "Profile URL": inf.get("profile_url", ""),
+            "Follower Count": int(inf.get("follower_count") or 0),
+            "Engagement Rate (%)": float(inf.get("engagement_rate") or 0),
+            "Category / Niche": inf.get("category_niche", "Unknown"),
+            "Content Themes": infer_content_themes(content),
+            "Contact Email": email,
             "Filter Status": "PASSED" if passed else "FAILED",
             "Filter Reason": reason,
-            "Recent Content": inf.get("recent_post_caption", "")
-        }
-        processed_records.append(enriched_record)
-        
-    df = pd.DataFrame(processed_records)
-    output_path = "data/enriched_influencers.csv"
-    df.to_csv(output_path, index=False)
-    print(f"Processed {len(df)} records. Saved to {output_path}")
+            "Recent Content": content,
+            "Data Source": inf.get("data_source", "Source not recorded"),
+        })
+    df = pd.DataFrame(processed)
+    output = DATA_DIR / "enriched_influencers.csv"
+    df.to_csv(output, index=False)
     return df
 
+
 if __name__ == "__main__":
-    process_and_enrich()
+    df = process_and_enrich()
+    print(f"Processed {len(df)} records. Saved to {DATA_DIR / 'enriched_influencers.csv'}")
